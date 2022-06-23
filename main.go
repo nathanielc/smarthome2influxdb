@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
-	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -17,35 +17,80 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/nathanielc/smarthome"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 )
 
-var mqttURL = flag.String("mqtt", "tcp://localhost:1883", "URL for connecting to MQTT broker")
-var influxDBURL = flag.String("influxdb", "http://localhost:8086", "URL for connecting to InfluxDB database")
-var database = flag.String("database", "mqtt-smarthome", "Name of InfluxDB database")
-
-var bp = newBufferPool()
-
-var writeURL string
+var runFlags = struct {
+	mqttURL     string
+	influxDBURL string
+	bucket      string
+	org         string
+	token       string
+}{}
 
 func main() {
-	flag.Parse()
 
-	q := url.Values{}
-	q.Set("db", *database)
-	writeURL = *influxDBURL + "/write?" + q.Encode()
-	c, err := connect(*mqttURL)
+	var cmdRun = &cobra.Command{
+		Use:   "run",
+		Short: "Listen to smarthome MQTT messages and record in InfluxDB",
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			v := viper.New()
+			v.SetEnvPrefix("SH2INFLUX")
+			v.AutomaticEnv()
+
+			// Bind each cobra flag to its associated viper configuration (config file and environment variable)
+			cmd.Flags().VisitAll(func(f *pflag.Flag) {
+				// Apply the viper config value to the flag when the flag is not set and viper has a value
+				if !f.Changed && v.IsSet(f.Name) {
+					val := v.Get(f.Name)
+					cmd.Flags().Set(f.Name, fmt.Sprintf("%v", val))
+				}
+			})
+			return nil
+		},
+		RunE: run,
+	}
+	cmdRun.Flags().StringVarP(&runFlags.mqttURL, "mqtt", "m", "tcp://localhost:1883", "URL for connecting to MQTT broker, can be set with MQTT_URL")
+	cmdRun.Flags().StringVarP(&runFlags.influxDBURL, "influxdb", "i", "http://localhost:8086", "URL for connecting to InfluxDB database, can be set with env INFLUXDB_URL")
+	cmdRun.Flags().StringVarP(&runFlags.bucket, "bucket", "b", "smarthome", "Name of InfluxDB bucket, can be set with env INFLUXDB_BUCKET")
+	cmdRun.Flags().StringVarP(&runFlags.org, "org", "o", "", "Name of InfluxDB organization, can be set with env INFLUXDB_ORG")
+	cmdRun.Flags().StringVarP(&runFlags.token, "token", "t", "", "Name of InfluxDB organization, can be set with env INFLUXDB_TOKEN")
+
+	var rootCmd = &cobra.Command{
+		Use: "smarthome2influxdb",
+	}
+	rootCmd.AddCommand(cmdRun)
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+}
+
+var bp = newBufferPool()
+var writeURL string
+
+func run(cmd *cobra.Command, args []string) error {
+	q := make(url.Values)
+	q.Add("bucket", runFlags.bucket)
+	q.Add("org", runFlags.org)
+	writeURL = runFlags.influxDBURL + "/api/v2/write?" + q.Encode()
+	log.Printf("writeURL: %s", writeURL)
+	c, err := connect(runFlags.mqttURL)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer c.Disconnect(150)
 	err = subscribe(c)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	signals := make(chan os.Signal)
 	signal.Notify(signals, os.Interrupt, syscall.SIGKILL)
 	<-signals
+	return nil
 }
 
 func connect(addr string) (mqtt.Client, error) {
@@ -112,13 +157,11 @@ func doStatus(c mqtt.Client, m mqtt.Message) {
 	buf.WriteRune(' ')
 	buf.WriteString(strconv.FormatInt(v.Time.UnixNano(), 10))
 	buf.WriteRune('\n')
-	fmt.Println(buf.String())
-	req, err := http.Post(writeURL, "application/octet-stream", buf)
+	log.Println("writing status event:", buf.String())
+	err := write(buf)
 	if err != nil {
-		log.Println(err)
-		return
+		log.Printf("error writing status event: %s", err)
 	}
-	req.Body.Close()
 }
 
 func doConnected(c mqtt.Client, m mqtt.Message) {
@@ -144,14 +187,28 @@ func doConnected(c mqtt.Client, m mqtt.Message) {
 	buf.WriteRune(' ')
 	buf.WriteString(strconv.FormatInt(v.Time.UnixNano(), 10))
 	buf.WriteRune('\n')
-	fmt.Println(m.Topic(), string(m.Payload()))
-	fmt.Println(v, buf.String())
-	req, err := http.Post(writeURL, "application/octet-stream", buf)
+	log.Println("writing connected event: ", buf.String())
+	err := write(buf)
 	if err != nil {
-		log.Println(err)
-		return
+		log.Printf("error writing connected event: %s", err)
 	}
-	req.Body.Close()
+}
+
+func write(data io.Reader) error {
+	req, err := http.NewRequest("POST", writeURL, data)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Token "+runFlags.token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("unexpected HTTP status code: %d", res.StatusCode)
+	}
+
+	return res.Body.Close()
 }
 
 type bufferPool sync.Pool
